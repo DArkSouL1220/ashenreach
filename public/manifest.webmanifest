@@ -1,0 +1,11 @@
+{
+  "name": "Ashenreach",
+  "short_name": "Ashenreach",
+  "description": "Echtzeit-Strategie für Touch: Die Aschenmark gegen die Hohle Legion.",
+  "start_url": "./",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#05080f",
+  "theme_color": "#05080f",
+  "icons": [{ "src": "./icon.png", "sizes": "180x180", "type": "image/png" }]
+}
