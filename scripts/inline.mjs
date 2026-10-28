@@ -23,7 +23,7 @@ html = html.replace(/<link rel="stylesheet"[^>]*href="\.?\/?(assets\/[^"]+)">/, 
 writeFileSync(join(single, 'index.html'), html);
 for (const f of ['icon.png', 'manifest.webmanifest']) if (existsSync(join(dist, f))) copyFileSync(join(dist, f), join(single, f));
 
-const body = src.match(/<body>([\s\S]*?)<script/)?.[1]?.trim() ?? '';
+const body = (src.match(/<body>([\s\S]*?)<\/body>/)?.[1] ?? '').replace(/<script type="module"[^>]*><\/script>/, '').trim();
 const title = src.match(/<title>(.*?)<\/title>/)?.[1] ?? 'Ashenreach';
 const fragment = `<title>${title}</title>\n<style>\n${css}\n</style>\n${body}\n<script type="module">\n${js}\n</script>\n`;
 writeFileSync(join(artifact, 'index.html'), fragment);

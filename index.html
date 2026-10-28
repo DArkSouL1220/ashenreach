@@ -15,6 +15,28 @@
     <title>Ashenreach</title>
   </head>
   <body>
+    <script>
+      // Frühe Fehleranzeige: läuft vor dem Spielmodul und fängt auch Lade-/Syntaxfehler.
+      (function () {
+        function box() {
+          var el = document.getElementById('errbox');
+          if (!el) {
+            el = document.createElement('pre');
+            el.id = 'errbox';
+            el.style.cssText = 'position:fixed;left:8px;right:8px;top:60px;z-index:99;background:#5a1010;color:#fff;padding:8px;border-radius:8px;font:11px monospace;white-space:pre-wrap;max-height:40vh;overflow:auto';
+            document.body.appendChild(el);
+          }
+          return el;
+        }
+        window.addEventListener('error', function (e) {
+          box().textContent += (e.message || 'Fehler') + (e.lineno ? ' (Zeile ' + e.lineno + ')' : '') + '\n';
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          box().textContent += String(e.reason) + '\n';
+        });
+      })();
+    </script>
+    <div id="boot" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;color:#f2d16b;font:600 18px system-ui,sans-serif;background:#05080f">Ashenreach lädt …</div>
     <canvas id="game"></canvas>
     <div id="hud"></div>
     <script type="module" src="/src/main.ts"></script>

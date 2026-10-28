@@ -5,6 +5,7 @@ import { Hud } from './hud';
 import { Input } from './input';
 import { Renderer } from './render';
 
+document.getElementById('boot')?.remove();
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const app = { game: new Game((Date.now() % 100000) + 1) };
 const cam = new Camera();
