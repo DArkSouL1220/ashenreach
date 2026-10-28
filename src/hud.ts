@@ -1,8 +1,9 @@
 import { Camera } from './camera';
-import { BUILDINGS, PLAYER_BUILD_ORDER, SHOCKWAVE, UNITS } from './defs';
+import { ABILITIES, BUILDINGS, PLAYER_BUILD_ORDER, UNITS, UPGRADES } from './defs';
 import { Building, Entity, Game, Unit } from './game';
 import { MAP_H, MAP_W, TILE } from './map';
 import type { Renderer } from './render';
+import { sound } from './sound';
 
 export interface Targeting {
   type: 'move' | 'attackmove' | 'build';
@@ -18,6 +19,7 @@ interface Cmd {
   disabled?: boolean;
   active?: boolean;
   hot?: string;
+  title?: string;
   run: () => void;
 }
 
@@ -36,21 +38,26 @@ export class Hud {
   private infoSig = '';
   private refreshTimer = 0;
   private minimapTimer = 0;
+  private portraitTimer = 0;
   private els: Record<string, HTMLElement> = {};
   private cmds: Cmd[] = [];
   private ended = false;
+  private portrait: HTMLCanvasElement | null = null;
 
-  constructor(private app: App, private cam: Camera, private renderer: Renderer, private onRestart: () => void) {
+  constructor(private app: App, private cam: Camera, private renderer: Renderer, private onRestart: (load: boolean) => void) {
     const root = document.getElementById('hud')!;
     root.innerHTML = `
       <div id="top">
-        <div class="res" id="gold">💰 0</div>
-        <div class="res" id="wood">🪵 0</div>
-        <div class="res" id="supply">👥 0/0</div>
+        <div class="res" id="gold" title="Gold">💰 0</div>
+        <div class="res" id="wood" title="Holz">🪵 0</div>
+        <div class="res" id="supply" title="Versorgung">👥 0/0</div>
         <div class="res" id="clock">0:00</div>
         <div class="spacer"></div>
+        <button class="tb" id="btnAlert" title="Zum Angriff springen" hidden>🚨</button>
+        <button class="tb" id="btnIdle" title="Untätiger Arbeiter" hidden>⛏️<span class="badge" id="idleCount"></span></button>
         <button class="tb" id="btnArmy" title="Armee auswählen">🛡️</button>
         <button class="tb" id="btnHero" title="Zur Heldin">⭐</button>
+        <button class="tb" id="btnSound" title="Ton">🔊</button>
         <button class="tb" id="btnPause" title="Pause">⏸</button>
       </div>
       <div id="toasts"></div>
@@ -61,9 +68,10 @@ export class Hud {
         <div id="cmd"></div>
       </div>
       <div id="overlay"></div>`;
-    for (const id of ['top', 'gold', 'wood', 'supply', 'clock', 'toasts', 'banner', 'bannerText', 'bannerCancel', 'minimap', 'info', 'cmd', 'overlay', 'btnArmy', 'btnHero', 'btnPause']) this.els[id] = document.getElementById(id)!;
+    for (const id of ['top', 'gold', 'wood', 'supply', 'clock', 'toasts', 'banner', 'bannerText', 'bannerCancel', 'minimap', 'info', 'cmd', 'overlay', 'btnArmy', 'btnHero', 'btnPause', 'btnAlert', 'btnIdle', 'idleCount', 'btnSound']) this.els[id] = document.getElementById(id)!;
 
     this.els.btnArmy.onclick = () => {
+      sound.play('click');
       const g = this.app.game;
       const army = g.units.filter((u) => u.faction === 'player' && !u.dead && u.def.kind !== 'worker');
       if (army.length) {
@@ -73,6 +81,7 @@ export class Hud {
       } else g.msg('Keine Kampfeinheiten.');
     };
     this.els.btnHero.onclick = () => {
+      sound.play('click');
       const g = this.app.game;
       const h = g.hero('player');
       if (h) {
@@ -89,10 +98,30 @@ export class Hud {
         g.msg('Die Wächterin kann im Bergfried wiederbelebt werden.');
       }
     };
-    this.els.btnPause.onclick = () => {
-      this.paused = !this.paused;
-      this.els.btnPause.textContent = this.paused ? '▶️' : '⏸';
+    this.els.btnIdle.onclick = () => {
+      sound.play('click');
+      const g = this.app.game;
+      const idle = g.idleWorkers();
+      if (!idle.length) return;
+      const cur = g.selection.length === 1 ? idle.indexOf(g.selection[0] as Unit) : -1;
+      const next = idle[(cur + 1) % idle.length];
+      g.select([next]);
+      this.cam.centerOn(next.x, next.y);
+      this.onSelectionChanged();
     };
+    this.els.btnAlert.onclick = () => {
+      const a = this.app.game.alert;
+      if (a) this.cam.centerOn(a.x, a.y);
+    };
+    this.els.btnSound.onclick = () => {
+      sound.enabled = !sound.enabled;
+      this.els.btnSound.textContent = sound.enabled ? '🔊' : '🔇';
+      if (sound.enabled) {
+        sound.unlock();
+        sound.play('click');
+      }
+    };
+    this.els.btnPause.onclick = () => this.setPaused(!this.paused);
     this.els.bannerCancel.onclick = () => this.clearTargeting();
 
     const mm = this.els.minimap as HTMLCanvasElement;
@@ -113,32 +142,57 @@ export class Hud {
     this.showStart();
   }
 
+  setPaused(p: boolean) {
+    this.paused = p;
+    this.els.btnPause.textContent = p ? '▶️' : '⏸';
+  }
+
   // ---------- Overlays ----------
 
   private showStart() {
+    const canResume = Game.hasSave();
     this.els.overlay.innerHTML = `
       <div class="panel">
         <h1>Ashenreach</h1>
         <p class="sub">Die Aschenmark gegen die Hohle Legion</p>
         <ul class="howto">
-          <li><b>Tippen</b> wählt Einheiten, Tippen auf Boden/Ziel gibt Befehle.</li>
-          <li><b>Ziehen</b> bewegt die Kamera, <b>Pinch</b> zoomt.</li>
-          <li><b>Lange drücken + ziehen</b> wählt mehrere Einheiten.</li>
-          <li>Arbeiter sammeln Gold an Minen und Holz an Bäumen. Baue Gehöfte für Versorgung, eine Kaserne für Truppen.</li>
-          <li>Die Wächterin steigt durch Kämpfe auf. Zerstöre die <b>Gruft</b> der Legion im Nordosten!</li>
+          <li><b>Tippen</b> wählt Einheiten; mit Auswahl auf Boden oder Ziel tippen gibt Befehle.</li>
+          <li><b>Ziehen</b> bewegt die Kamera, <b>Pinch</b> zoomt, <b>lange drücken + ziehen</b> wählt mehrere.</li>
+          <li>Arbeiter sammeln Gold an Minen und Holz an Bäumen. Gehöfte geben Versorgung, die Kaserne Truppen, die Schmiede Upgrades, Ritter und Katapulte.</li>
+          <li>Kreaturenlager bewachen die freien Minen: Beute und Erfahrung für die Wächterin.</li>
+          <li>Nachts sieht man weniger weit. Zerstöre die <b>Gruft</b> im Nordosten!</li>
         </ul>
-        <button class="big" id="btnStart">Spielen</button>
+        <div class="btnrow">
+          ${canResume ? '<button class="big" id="btnResume">Fortsetzen</button>' : ''}
+          <button class="big ${canResume ? 'secondary' : ''}" id="btnStart">${canResume ? 'Neues Spiel' : 'Spielen'}</button>
+        </div>
       </div>`;
     this.els.overlay.hidden = false;
-    document.getElementById('btnStart')!.onclick = () => this.autostart();
+    document.getElementById('btnStart')!.onclick = () => {
+      sound.unlock();
+      if (canResume) {
+        Game.clearSave();
+        this.onRestart(false);
+      }
+      this.autostart();
+    };
+    const r = document.getElementById('btnResume');
+    if (r) r.onclick = () => {
+      sound.unlock();
+      this.onRestart(true);
+      this.autostart();
+    };
   }
 
   autostart() {
     this.els.overlay.hidden = true;
     this.running = true;
+    this.ended = false;
+    this.setPaused(false);
     const g = this.app.game;
-    const keep = g.buildings.find((b) => b.faction === 'player' && b.def.isHall)!;
-    this.cam.centerOn(keep.x, keep.y - 40);
+    const keep = g.buildings.find((b) => b.faction === 'player' && b.def.isHall) ?? g.units.find((u) => u.faction === 'player');
+    if (keep) this.cam.centerOn(keep.x, keep.y - 40);
+    this.onSelectionChanged();
   }
 
   private showEnd() {
@@ -153,14 +207,10 @@ export class Hud {
       </div>`;
     this.els.overlay.hidden = false;
     document.getElementById('btnRestart')!.onclick = () => {
-      this.ended = false;
-      this.els.overlay.hidden = true;
-      this.onRestart();
+      this.onRestart(false);
       this.clearTargeting();
       this.buildMenu = false;
-      const keep = this.app.game.buildings.find((b) => b.faction === 'player' && b.def.isHall)!;
-      this.cam.centerOn(keep.x, keep.y - 40);
-      this.onSelectionChanged();
+      this.autostart();
     };
   }
 
@@ -218,6 +268,12 @@ export class Hud {
       this.minimapTimer = 0.25;
       this.drawMinimap();
     }
+    this.portraitTimer -= dt;
+    if (this.portraitTimer <= 0) {
+      this.portraitTimer = 0.5;
+      const sel = g.selection.filter((e) => !e.dead);
+      if (this.portrait && sel.length === 1) this.renderer.drawPortrait(this.portrait, sel[0]);
+    }
   }
 
   private refresh(force: boolean) {
@@ -227,7 +283,11 @@ export class Hud {
     const used = g.supplyUsed('player'), cap = g.supplyCap('player');
     this.els.supply.textContent = `👥 ${used}/${cap}`;
     this.els.supply.classList.toggle('warn', used >= cap);
-    this.els.clock.textContent = this.fmtTime(g.time) + (g.stats.waves ? ` · W${g.stats.waves}` : '');
+    this.els.clock.textContent = `${g.isNight() ? '🌙' : '☀️'} ${this.fmtTime(g.time)}${g.stats.waves ? ` · W${g.stats.waves}` : ''}`;
+    const idle = g.idleWorkers().length;
+    this.els.btnIdle.hidden = idle === 0;
+    this.els.idleCount.textContent = idle ? String(idle) : '';
+    this.els.btnAlert.hidden = !g.alert;
     this.els.toasts.innerHTML = g.messages.map((m) => `<div class="toast" style="opacity:${m.t > 2.5 ? ((3.5 - m.t) / 1).toFixed(2) : 1}">${esc(m.text)}</div>`).join('');
     this.refreshCommands(force);
     this.refreshInfo(force);
@@ -248,7 +308,7 @@ export class Hud {
           const def = BUILDINGS[id];
           const can = g.res.player.gold >= def.gold && g.res.player.wood >= def.wood;
           cmds.push({
-            id: 'b_' + id, icon: def.icon, label: def.name, cost: `${def.gold}💰 ${def.wood}🪵`, disabled: !can, active: t?.type === 'build' && t.defId === id,
+            id: 'b_' + id, icon: def.icon, label: def.name, cost: `${def.gold}💰 ${def.wood}🪵`, disabled: !can, active: t?.type === 'build' && t.defId === id, title: def.desc,
             run: () => this.setTargeting({ type: 'build', defId: id, label: `${def.name} platzieren` }),
           });
         }
@@ -258,8 +318,9 @@ export class Hud {
         cmds.push({ id: 'stop', icon: '✋', label: 'Halt', hot: 'h', run: () => g.cmdStop(units) });
         if (combat.length) cmds.push({ id: 'amove', icon: '⚔️', label: 'Angriff', hot: 'a', active: t?.type === 'attackmove', run: () => this.setTargeting({ type: 'attackmove', label: 'Angriffsbewegung' }) });
         if (hero) {
-          const cd = hero.abilityCd;
-          cmds.push({ id: 'shock', icon: '💥', label: cd > 0 ? `Erdstoß ${Math.ceil(cd)}s` : 'Erdstoß', hot: 'q', disabled: cd > 0, run: () => g.cmdShockwave(hero) });
+          const A = ABILITIES.shockwave, B = ABILITIES.blessing;
+          cmds.push({ id: 'shock', icon: A.icon, label: hero.abilityCd > 0 ? `${A.name} ${Math.ceil(hero.abilityCd)}s` : A.name, hot: 'q', disabled: hero.abilityCd > 0, title: A.desc, run: () => g.cmdShockwave(hero) });
+          cmds.push({ id: 'bless', icon: B.icon, label: hero.blessCd > 0 ? `${B.name} ${Math.ceil(hero.blessCd)}s` : B.name, hot: 'w', disabled: hero.blessCd > 0, title: B.desc, run: () => g.cmdBlessing(hero) });
         }
         if (workers.length) {
           cmds.push({ id: 'build', icon: '🏗️', label: 'Bauen', hot: 'b', run: () => this.setBuildMenu(true) });
@@ -273,14 +334,26 @@ export class Hud {
       } else {
         for (const id of b.def.trains) {
           const def = UNITS[id];
-          let gold = def.gold, label = def.name;
+          let label = def.name;
           if (id === 'warden') {
             if (g.hero('player') || g.heroQueued()) continue;
-            gold = g.heroCost();
             label = g.heroSummoned ? 'Wiederbeleben' : def.name;
           }
-          const can = g.res.player.gold >= gold && g.res.player.wood >= def.wood;
-          cmds.push({ id: 't_' + id, icon: def.icon, label, cost: `${gold}💰${def.wood ? ` ${def.wood}🪵` : ''}`, disabled: !can, run: () => g.cmdTrain(b, id) });
+          const c = g.canTrain(b, id);
+          const locked = !!def.requires && !g.hasBuilding('player', def.requires);
+          cmds.push({ id: 't_' + id, icon: locked ? '🔒' : def.icon, label, cost: `${c.gold}💰${c.wood ? ` ${c.wood}🪵` : ''}`, disabled: !c.ok, title: locked ? c.why : def.desc, run: () => g.cmdTrain(b, id) });
+        }
+        for (const id of b.def.upgrades ?? []) {
+          const up = UPGRADES[id];
+          const lvl = g.research.player[id] ?? 0;
+          if (lvl >= up.levels.length) {
+            cmds.push({ id: 'u_' + id, icon: up.icon, label: `${up.name} max`, disabled: true, title: up.desc, run: () => {} });
+            continue;
+          }
+          const cost = up.levels[lvl];
+          const queued = g.researchQueued('player', id);
+          const can = !queued && g.res.player.gold >= cost.gold && g.res.player.wood >= cost.wood;
+          cmds.push({ id: 'u_' + id, icon: up.icon, label: `${up.name} ${lvl + 1}`, cost: `${cost.gold}💰 ${cost.wood}🪵`, disabled: !can, title: up.desc, run: () => g.cmdResearch(b, id) });
         }
         if (b.queue.length) cmds.push({ id: 'cancelq', icon: '❌', label: 'Letztes abbr.', run: () => g.cmdCancelTrain(b) });
       }
@@ -300,6 +373,7 @@ export class Hud {
       const b = document.createElement('button');
       b.className = 'cb' + (c.active ? ' active' : '');
       b.disabled = !!c.disabled;
+      if (c.title) b.title = c.title;
       b.innerHTML = `<span class="ic">${c.icon}</span><span class="lb">${esc(c.label)}</span>${c.cost ? `<span class="cost">${c.cost}</span>` : ''}`;
       b.onclick = () => {
         c.run();
@@ -316,7 +390,7 @@ export class Hud {
     let sig = '';
     if (!sel.length) {
       sig = 'none';
-      html = `<div class="hint">Tippe auf eine Einheit oder ein Gebäude.<br>🛡️ wählt deine Armee, ⭐ springt zur Heldin.</div>`;
+      html = `<div class="hint">Tippe auf eine Einheit oder ein Gebäude.<br>🛡️ wählt deine Armee, ⭐ springt zur Heldin, ⛏️ zum nächsten untätigen Arbeiter.</div>`;
     } else if (sel.length === 1) {
       const e = sel[0];
       sig = 'one' + e.id;
@@ -329,7 +403,6 @@ export class Hud {
         [...groups.entries()].map(([id, us]) => `<button class="chip" data-type="${id}">${UNITS[id].icon} ${us.length}</button>`).join('') + '</div>';
     }
     if (!force && sig === this.infoSig) {
-      // nur dynamische Werte aktualisieren
       if (sel.length === 1) {
         const dyn = this.els.info.querySelector('.dyn');
         if (dyn) dyn.innerHTML = this.entityDynamic(sel[0]);
@@ -338,6 +411,8 @@ export class Hud {
     }
     this.infoSig = sig;
     this.els.info.innerHTML = html;
+    this.portrait = this.els.info.querySelector<HTMLCanvasElement>('canvas.portrait');
+    if (this.portrait && sel.length === 1) this.renderer.drawPortrait(this.portrait, sel[0]);
     this.els.info.querySelectorAll<HTMLButtonElement>('.chip').forEach((btn) => {
       btn.onclick = () => {
         const id = btn.dataset.type!;
@@ -348,29 +423,39 @@ export class Hud {
   }
 
   private entityInfo(e: Entity): string {
-    if (e.type === 'mine') return `<div class="title">⛰️ Goldmine</div><div class="dyn">${this.entityDynamic(e)}</div>`;
-    const def = e.type === 'unit' ? e.def : e.def;
+    const portrait = `<canvas class="portrait" width="64" height="64"></canvas>`;
+    if (e.type === 'mine') return `<div class="row">${portrait}<div class="col"><div class="title">Goldmine</div><div class="dyn">${this.entityDynamic(e)}</div></div></div>`;
+    const def = e.def;
     const own = e.faction === 'player';
-    return `<div class="title">${def.icon} ${esc(def.name)}${own ? '' : ' <span class="enemy">(Feind)</span>'}</div><div class="dyn">${this.entityDynamic(e)}</div><div class="desc">${esc(def.desc)}</div>`;
+    const tag = own ? '' : e.faction === 'creep' ? ' <span class="enemy">(Kreatur)</span>' : ' <span class="enemy">(Feind)</span>';
+    return `<div class="row">${portrait}<div class="col"><div class="title">${esc(def.name)}${tag}</div><div class="dyn">${this.entityDynamic(e)}</div><div class="desc">${esc(def.desc)}</div></div></div>`;
   }
 
   private entityDynamic(e: Entity): string {
+    const g = this.app.game;
     if (e.type === 'mine') return `Gold: ${e.gold}`;
     const hp = `<div class="barrow"><div class="bar"><div class="fill" style="width:${((100 * e.hp) / e.maxHp).toFixed(0)}%"></div></div><span>${Math.ceil(e.hp)}/${e.maxHp}</span></div>`;
     let extra = '';
     if (e.type === 'unit') {
+      if (e.def.kind !== 'worker') extra += `<div class="stats">⚔️ ${g.unitDamage(e)} · 🛡️ ${g.unitArmor(e)}${e.def.range > 40 ? ` · 🎯 ${e.def.range}` : ''}</div>`;
       if (e.def.kind === 'hero') {
         const need = 120 * e.level;
-        extra += `<div>Stufe ${e.level} · Schaden ${this.app.game.unitDamage(e)}</div><div class="barrow"><div class="bar xp"><div class="fill" style="width:${((100 * e.xp) / need).toFixed(0)}%"></div></div><span>XP ${e.xp}/${need}</span></div>`;
-        if (e.faction === 'player') extra += `<div>Erdstoß: ${e.abilityCd > 0 ? `${Math.ceil(e.abilityCd)}s` : 'bereit'} · ${SHOCKWAVE.baseDamage + SHOCKWAVE.perLevel * (e.level - 1)} Schaden im Umkreis</div>`;
+        extra += `<div>Stufe ${e.level}</div><div class="barrow"><div class="bar xp"><div class="fill" style="width:${((100 * e.xp) / need).toFixed(0)}%"></div></div><span>XP ${e.xp}/${need}</span></div>`;
       }
       if (e.carry) extra += `<div>Trägt ${e.carry.amount} ${e.carry.res === 'gold' ? 'Gold' : 'Holz'}</div>`;
-      extra += `<div class="order">${this.orderText(e)}</div>`;
+      if (e.faction === 'player') extra += `<div class="order">${this.orderText(e)}</div>`;
     } else {
       const b = e as Building;
       if (!b.built) extra += `<div>Im Bau: ${(b.progress * 100).toFixed(0)}%</div>`;
-      else if (b.queue.length) extra += `<div>Ausbildung: ${UNITS[b.queue[0].id].icon} ${((100 * b.queue[0].t) / b.queue[0].total).toFixed(0)}% ${b.queue.slice(1).map((q) => UNITS[q.id].icon).join(' ')}</div>`;
+      else if (b.queue.length) {
+        const q = b.queue[0];
+        const icon = q.id.startsWith('up:') ? UPGRADES[q.id.slice(3)].icon : UNITS[q.id].icon;
+        const rest = b.queue.slice(1).map((x) => (x.id.startsWith('up:') ? UPGRADES[x.id.slice(3)].icon : UNITS[x.id].icon)).join(' ');
+        extra += `<div>In Arbeit: ${icon} ${((100 * q.t) / q.total).toFixed(0)}% ${rest}</div>`;
+      }
       if (b.def.supply) extra += `<div>Versorgung +${b.def.supply}</div>`;
+      if (b.def.attack) extra += `<div class="stats">⚔️ ${b.def.attack.damage} · 🎯 ${b.def.attack.range}</div>`;
+      if (b.faction === 'player' && b.built && b.def.trains.length) extra += `<div class="order">${b.rally ? 'Sammelpunkt gesetzt' : 'Tippe auf die Karte für einen Sammelpunkt'}</div>`;
     }
     return hp + extra;
   }
@@ -394,8 +479,6 @@ export class Hud {
     const s = mm.width / MAP_W;
     c.imageSmoothingEnabled = false;
     c.drawImage(this.renderer.thumb, 0, 0, mm.width, mm.height);
-    // Nebel
-    c.fillStyle = 'rgba(0,0,0,.5)';
     for (let ty = 0; ty < MAP_H; ty++)
       for (let tx = 0; tx < MAP_W; tx++) {
         const v = g.vis[ty * MAP_W + tx];
@@ -405,7 +488,15 @@ export class Hud {
       }
     for (const m of g.mines) if (g.isExplored(m.x, m.y)) { c.fillStyle = '#f5c542'; c.fillRect(m.tx * s, m.ty * s, m.size * s, m.size * s); }
     for (const b of g.buildings) if (!b.dead && g.playerCanSee(b)) { c.fillStyle = b.faction === 'player' ? '#5bd46b' : '#ff5050'; c.fillRect(b.tx * s, b.ty * s, b.size * s, b.size * s); }
-    for (const u of g.units) if (!u.dead && g.playerCanSee(u)) { c.fillStyle = u.faction === 'player' ? (u.def.kind === 'hero' ? '#fff0a0' : '#8fff9b') : '#ff7070'; c.fillRect((u.x / TILE) * s - 1, (u.y / TILE) * s - 1, 2.5, 2.5); }
+    for (const u of g.units) if (!u.dead && g.playerCanSee(u)) { c.fillStyle = u.faction === 'player' ? (u.def.kind === 'hero' ? '#fff0a0' : '#8fff9b') : u.faction === 'creep' ? '#e0b060' : '#ff7070'; c.fillRect((u.x / TILE) * s - 1, (u.y / TILE) * s - 1, 2.5, 2.5); }
+    if (g.alert) {
+      const k = ((performance.now() / 500) % 1);
+      c.strokeStyle = `rgba(255,80,60,${1 - k})`;
+      c.lineWidth = 2;
+      c.beginPath();
+      c.arc((g.alert.x / TILE) * s, (g.alert.y / TILE) * s, 4 + k * 8, 0, Math.PI * 2);
+      c.stroke();
+    }
     c.strokeStyle = '#fff';
     c.lineWidth = 1;
     c.strokeRect((this.cam.x / TILE) * s, (this.cam.y / TILE) * s, (this.cam.w / this.cam.zoom / TILE) * s, (this.cam.h / this.cam.zoom / TILE) * s);

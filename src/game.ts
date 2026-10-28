@@ -1,14 +1,16 @@
 import {
-  BUILDINGS, BuildingDef, CARRY_AMOUNT, Faction, GOLD_MINE_TIME, HERO_MAX_LEVEL, HERO_XP_PER_LEVEL, MAX_SUPPLY,
-  SHOCKWAVE, UNITS, UnitDef, WOOD_CHOP_TIME,
+  ABILITIES, BUILDINGS, BuildingDef, CARRY_AMOUNT, DAY_LENGTH, Faction, GOLD_MINE_TIME, HERO_MAX_LEVEL, HERO_XP_PER_LEVEL, MAX_SUPPLY,
+  SIEGE_BUILDING_MULT, SIEGE_UNIT_MULT, UNITS, UPGRADES, UnitDef, WOOD_CHOP_TIME, hostile,
 } from './defs';
-import { EnemyAI } from './ai';
+import { EnemyAI, AiState } from './ai';
 import { GameMap, MAP_H, MAP_W, T_GRASS, T_TREE, TILE, TilePos } from './map';
 import { dist, Pt } from './math';
 import { findPath } from './path';
+import { sound } from './sound';
 
 /** Reichweite für Sammeln/Bauen/Abliefern: deckt auch diagonale Nachbarfelder ab. */
 const INTERACT_RANGE = 17;
+const SAVE_KEY = 'ashenreach-save-v2';
 
 export type Order =
   | { kind: 'idle' }
@@ -42,6 +44,7 @@ export interface Unit extends EntityBase {
   goal: Pt | null;
   cooldown: number;
   abilityCd: number;
+  blessCd: number;
   acquireTimer: number;
   repathTimer: number;
   waitTimer: number;
@@ -55,10 +58,13 @@ export interface Unit extends EntityBase {
   lastX: number;
   lastY: number;
   attackAnim: number;
+  walkPhase: number;
+  moving: boolean;
+  home: Pt | null; // Kreaturen kehren hierher zurück
 }
 
 export interface QueueItem {
-  id: string;
+  id: string; // Einheit oder "up:<upgrade>"
   t: number;
   total: number;
 }
@@ -74,6 +80,8 @@ export interface Building extends EntityBase {
   queue: QueueItem[];
   cooldown: number;
   supplyWarn: number;
+  rally: Pt | null;
+  smoke: number;
 }
 
 export interface Mine extends EntityBase {
@@ -87,7 +95,7 @@ export interface Mine extends EntityBase {
 export type Entity = Unit | Building | Mine;
 
 export interface Effect {
-  kind: 'ring' | 'hit' | 'death' | 'ping' | 'pingAttack' | 'text' | 'boom' | 'levelup';
+  kind: 'ring' | 'hit' | 'death' | 'ping' | 'pingAttack' | 'text' | 'boom' | 'levelup' | 'heal' | 'blood' | 'rally' | 'smoke';
   x: number;
   y: number;
   t: number;
@@ -106,7 +114,10 @@ export interface Projectile {
   speed: number;
   damage: number;
   attacker: Entity;
-  color: string;
+  kind: 'arrow' | 'bolt' | 'rock' | 'spit';
+  arc: number; // Flughöhe für Bögen
+  total: number;
+  travelled: number;
 }
 
 export interface Resources {
@@ -115,15 +126,41 @@ export interface Resources {
 }
 
 export type MoveResult = 'inrange' | 'moving' | 'fail';
+export type Side = 'player' | 'enemy';
+
+export interface Alert {
+  x: number;
+  y: number;
+  t: number;
+}
+
+interface SaveData {
+  v: number;
+  seed: number;
+  time: number;
+  res: Record<Side, Resources>;
+  research: Record<Side, Record<string, number>>;
+  hero: { level: number; xp: number; summoned: boolean };
+  stats: { killed: number; lost: number; waves: number };
+  ai: AiState;
+  tiles: number[];
+  wood: number[];
+  vis: number[];
+  mines: { tx: number; ty: number; gold: number }[];
+  units: { def: string; faction: Faction; x: number; y: number; hp: number; level: number; xp: number; carry: Unit['carry']; gather: 'gold' | 'wood' | null; home: Pt | null }[];
+  buildings: { def: string; faction: Faction; tx: number; ty: number; hp: number; progress: number; built: boolean; queue: QueueItem[]; rally: Pt | null }[];
+}
 
 export class Game {
   map: GameMap;
+  seed: number;
   units: Unit[] = [];
   buildings: Building[] = [];
   mines: Mine[] = [];
   nextId = 1;
   time = 0;
-  res: Record<'player' | 'enemy', Resources> = { player: { gold: 300, wood: 150 }, enemy: { gold: 1e9, wood: 1e9 } };
+  res: Record<Side, Resources> = { player: { gold: 300, wood: 150 }, enemy: { gold: 1e9, wood: 1e9 } };
+  research: Record<Side, Record<string, number>> = { player: { attack: 0, armor: 0 }, enemy: { attack: 0, armor: 0 } };
   selection: Entity[] = [];
   selectionVersion = 0;
   effects: Effect[] = [];
@@ -138,12 +175,16 @@ export class Game {
   heroSummoned = false;
   ai = new EnemyAI();
   stats = { killed: 0, lost: 0, waves: 0 };
+  alert: Alert | null = null;
+  private alertTimer = 0;
   private grid = new Map<number, Unit[]>();
-  private spawnedHallTick = false;
+  private autosave = 30;
 
-  constructor(seed: number) {
+  constructor(seed: number, save?: SaveData) {
+    this.seed = seed;
     this.map = new GameMap(seed);
-    this.setup();
+    if (save) this.restore(save);
+    else this.setup();
     this.updateFog();
   }
 
@@ -172,7 +213,19 @@ export class Game {
     const crypt = this.buildings.find((b) => b.def.id === 'crypt')!;
     for (let i = 0; i < 4; i++) this.spawnUnit('husk', 'enemy', crypt.x - 60 + i * 40, crypt.y + 130);
     for (let i = 0; i < 2; i++) this.spawnUnit('spitter', 'enemy', crypt.x - 30 + i * 50, crypt.y + 165);
-    this.spawnedHallTick = true;
+
+    // Kreaturenlager an den freien Minen
+    const camp = (m: Mine, list: string[]) => {
+      list.forEach((id, i) => {
+        const a = (i / list.length) * Math.PI * 2;
+        const u = this.spawnUnit(id, 'creep', m.x + Math.cos(a) * 85, m.y + 60 + Math.sin(a) * 50);
+        if (u) u.home = { x: u.x, y: u.y };
+      });
+    };
+    camp(this.mines[2], ['brute', 'wolf', 'wolf']);
+    camp(this.mines[3], ['wolf', 'wolf', 'wolf']);
+    camp(this.mines[4], ['wolf', 'wolf', 'wolf']);
+    camp(this.mines[1], ['wolf', 'wolf']);
   }
 
   addMine(tx: number, ty: number, gold: number) {
@@ -196,8 +249,9 @@ export class Game {
     }
     const u: Unit = {
       id: this.nextId++, type: 'unit', faction, def, x, y, hp: def.hp, maxHp: def.hp, dead: false, sight: def.sight, radius: def.radius,
-      order: IDLE, path: [], pathIdx: 0, goal: null, cooldown: 0, abilityCd: 0, acquireTimer: Math.random() * 0.3, repathTimer: 0, waitTimer: 0,
-      facing: faction === 'player' ? -Math.PI / 2 : Math.PI / 2, carry: null, gatherTimer: 0, level: 1, xp: 0, stuck: 0, stuckCount: 0, lastX: x, lastY: y, attackAnim: 0,
+      order: IDLE, path: [], pathIdx: 0, goal: null, cooldown: 0, abilityCd: 0, blessCd: 0, acquireTimer: Math.random() * 0.3, repathTimer: 0, waitTimer: 0,
+      facing: faction === 'player' ? -Math.PI / 2 : Math.PI / 2, carry: null, gatherTimer: 0, level: 1, xp: 0, stuck: 0, stuckCount: 0, lastX: x, lastY: y,
+      attackAnim: 0, walkPhase: Math.random() * 6, moving: false, home: null,
     };
     if (def.kind === 'hero' && faction === 'player') {
       u.level = this.heroLevel;
@@ -226,7 +280,7 @@ export class Game {
       id: this.nextId++, type: 'building', faction, def, tx, ty, size: def.size,
       x: tx * TILE + (def.size * TILE) / 2, y: ty * TILE + (def.size * TILE) / 2,
       hp: built ? def.hp : Math.max(1, def.hp * 0.1), maxHp: def.hp, dead: false, sight: def.sight, radius: (def.size * TILE) / 2,
-      progress: built ? 1 : 0, built, queue: [], cooldown: 0, supplyWarn: 0,
+      progress: built ? 1 : 0, built, queue: [], cooldown: 0, supplyWarn: 0, rally: null, smoke: 0,
     };
     this.map.setBuildingBlock(tx, ty, def.size, true);
     this.buildings.push(b);
@@ -247,19 +301,144 @@ export class Game {
     }
   }
 
+  // ---------- Speichern ----------
+
+  toSave(): SaveData {
+    const gatherOf = (u: Unit): 'gold' | 'wood' | null => {
+      if (u.order.kind === 'gather') return u.order.res;
+      if (u.order.kind === 'return' && u.order.then.kind === 'gather') return u.order.then.res;
+      return u.carry ? u.carry.res : null;
+    };
+    return {
+      v: 2, seed: this.seed, time: this.time, res: this.res, research: this.research,
+      hero: { level: this.heroLevel, xp: this.heroXp, summoned: this.heroSummoned }, stats: this.stats, ai: this.ai.state(),
+      tiles: Array.from(this.map.tiles), wood: Array.from(this.map.wood), vis: Array.from(this.vis),
+      mines: this.mines.map((m) => ({ tx: m.tx, ty: m.ty, gold: m.gold })),
+      units: this.units.filter((u) => !u.dead).map((u) => ({ def: u.def.id, faction: u.faction, x: u.x, y: u.y, hp: u.hp, level: u.level, xp: u.xp, carry: u.carry, gather: gatherOf(u), home: u.home })),
+      buildings: this.buildings.filter((b) => !b.dead).map((b) => ({ def: b.def.id, faction: b.faction, tx: b.tx, ty: b.ty, hp: b.hp, progress: b.progress, built: b.built, queue: b.queue, rally: b.rally })),
+    };
+  }
+
+  private restore(s: SaveData) {
+    this.time = s.time;
+    this.res = s.res;
+    this.research = s.research;
+    this.heroLevel = s.hero.level;
+    this.heroXp = s.hero.xp;
+    this.heroSummoned = s.hero.summoned;
+    this.stats = s.stats;
+    this.ai.load(s.ai);
+    this.map.tiles.set(s.tiles);
+    this.map.wood.set(s.wood);
+    for (let i = 0; i < this.map.tiles.length; i++) this.map.blocked[i] = this.map.tiles[i] === T_GRASS ? 0 : 1;
+    this.vis.set(s.vis);
+    for (const m of s.mines) this.addMine(m.tx, m.ty, m.gold);
+    for (const b of s.buildings) {
+      const nb = this.placeBuilding(b.def, b.faction, b.tx, b.ty, b.built);
+      if (!nb) continue;
+      nb.hp = b.hp;
+      nb.progress = b.progress;
+      nb.queue = b.queue;
+      nb.rally = b.rally;
+    }
+    for (const u of s.units) {
+      const nu = this.spawnUnit(u.def, u.faction, u.x, u.y);
+      if (!nu) continue;
+      nu.hp = Math.min(u.hp, nu.maxHp);
+      nu.level = u.level;
+      nu.xp = u.xp;
+      nu.carry = u.carry;
+      nu.home = u.home;
+      if (nu.def.kind === 'hero') {
+        nu.maxHp = nu.def.hp + 50 * (nu.level - 1);
+        nu.hp = Math.min(u.hp, nu.maxHp);
+      }
+      if (u.gather === 'gold') nu.order = { kind: 'gather', res: 'gold', mine: this.nearestMine(nu.x, nu.y), tree: null };
+      else if (u.gather === 'wood') nu.order = { kind: 'gather', res: 'wood', mine: null, tree: null };
+    }
+    // Baustellen weiterbauen lassen
+    for (const b of this.buildings) {
+      if (b.built || b.faction !== 'player') continue;
+      const w = this.units.find((u) => u.faction === 'player' && u.def.kind === 'worker' && u.order.kind === 'idle');
+      if (w) w.order = { kind: 'build', building: b };
+    }
+  }
+
+  save(): boolean {
+    if (this.result !== 'none') return false;
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(this.toSave()));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  static hasSave(): boolean {
+    try {
+      return !!localStorage.getItem(SAVE_KEY);
+    } catch {
+      return false;
+    }
+  }
+
+  static load(): Game | null {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return null;
+      const s = JSON.parse(raw) as SaveData;
+      if (s.v !== 2) return null;
+      return new Game(s.seed, s);
+    } catch {
+      return null;
+    }
+  }
+
+  static clearSave() {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch {
+      /* egal */
+    }
+  }
+
   // ---------- Abfragen ----------
 
-  supplyUsed(f: 'player' | 'enemy') {
+  dayFrac() {
+    return (this.time % DAY_LENGTH) / DAY_LENGTH;
+  }
+
+  /** 0 = heller Tag, 1 = tiefste Nacht */
+  nightAmount() {
+    const f = this.dayFrac();
+    if (f < 0.5) return 0;
+    const n = (f - 0.5) / 0.5; // 0..1 über die Nachthälfte
+    return Math.sin(n * Math.PI);
+  }
+
+  isNight() {
+    return this.nightAmount() > 0.35;
+  }
+
+  unitSight(u: Unit) {
+    return u.sight * (this.isNight() ? 0.7 : 1);
+  }
+
+  supplyUsed(f: Side) {
     let s = 0;
     for (const u of this.units) if (u.faction === f && !u.dead) s += u.def.supply;
-    for (const b of this.buildings) if (b.faction === f && !b.dead) for (const q of b.queue) s += UNITS[q.id].supply;
+    for (const b of this.buildings) if (b.faction === f && !b.dead) for (const q of b.queue) if (!q.id.startsWith('up:')) s += UNITS[q.id].supply;
     return s;
   }
 
-  supplyCap(f: 'player' | 'enemy') {
+  supplyCap(f: Side) {
     let s = 0;
     for (const b of this.buildings) if (b.faction === f && !b.dead && b.built) s += b.def.supply;
     return Math.min(MAX_SUPPLY, s);
+  }
+
+  hasBuilding(f: Faction, defId: string) {
+    return this.buildings.some((b) => b.faction === f && b.def.id === defId && b.built && !b.dead);
   }
 
   hero(f: Faction): Unit | null {
@@ -274,8 +453,22 @@ export class Game {
     return this.buildings.some((b) => b.faction === 'player' && b.queue.some((q) => q.id === 'warden'));
   }
 
+  researchQueued(f: Faction, upId: string) {
+    return this.buildings.some((b) => b.faction === f && b.queue.some((q) => q.id === 'up:' + upId));
+  }
+
   unitDamage(u: Unit) {
-    return u.def.damage + (u.def.kind === 'hero' ? 4 * (u.level - 1) : 0);
+    const up = u.faction === 'player' || u.faction === 'enemy' ? this.research[u.faction].attack * 2 : 0;
+    return u.def.damage + (u.def.kind === 'hero' ? 4 * (u.level - 1) : 0) + (u.def.kind === 'worker' ? 0 : up);
+  }
+
+  unitArmor(u: Unit) {
+    const up = u.faction === 'player' || u.faction === 'enemy' ? this.research[u.faction].armor : 0;
+    return u.def.armor + (u.def.kind === 'hero' ? Math.floor((u.level - 1) / 2) : 0) + up;
+  }
+
+  idleWorkers(): Unit[] {
+    return this.units.filter((u) => u.faction === 'player' && !u.dead && u.def.kind === 'worker' && u.order.kind === 'idle');
   }
 
   isVisible(x: number, y: number) {
@@ -288,10 +481,10 @@ export class Game {
     return this.map.inBounds(tx, ty) && this.vis[ty * MAP_W + tx] >= 1;
   }
 
-  /** Sichtbarkeit aus Spielersicht (Gegner nur, wenn ihre Kachel sichtbar bzw. Gebäude erforscht). */
+  /** Sichtbarkeit aus Spielersicht (Fremde nur, wenn ihre Kachel sichtbar bzw. Gebäude erforscht). */
   playerCanSee(e: Entity) {
-    if (e.faction !== 'enemy') return true;
-    if (e.type === 'building') return this.isExplored(e.x, e.y) || this.isVisible(e.x, e.y);
+    if (e.faction === 'player' || e.faction === 'neutral') return true;
+    if (e.type === 'building') return this.isExplored(e.x, e.y);
     return this.isVisible(e.x, e.y);
   }
 
@@ -306,7 +499,7 @@ export class Game {
     return this.rectDist(a, r.x0, r.y0, r.x1, r.y1);
   }
 
-  rectDist(a: Unit, x0: number, y0: number, x1: number, y1: number) {
+  rectDist(a: { x: number; y: number; radius: number }, x0: number, y0: number, x1: number, y1: number) {
     const dx = Math.max(x0 - a.x, 0, a.x - x1), dy = Math.max(y0 - a.y, 0, a.y - y1);
     return Math.hypot(dx, dy) - a.radius;
   }
@@ -315,7 +508,9 @@ export class Game {
     let best: Unit | null = null, bestD = Infinity;
     for (const u of this.units) {
       if (u.dead || !this.playerCanSee(u)) continue;
-      const d = dist(u.x, u.y, wx, wy);
+      // Figuren stehen aufrecht: Trefferfläche reicht nach oben
+      const dx = wx - u.x, dy = wy - (u.y - u.radius * 0.8);
+      const d = Math.hypot(dx, dy * 0.8);
       if (d <= u.radius + 10 && d < bestD) {
         bestD = d;
         best = u;
@@ -325,8 +520,16 @@ export class Game {
     for (const b of this.buildings) {
       if (b.dead || !this.playerCanSee(b)) continue;
       const r = this.rectOf(b)!;
-      if (wx >= r.x0 && wx < r.x1 && wy >= r.y0 && wy < r.y1) return b;
+      if (wx >= r.x0 && wx < r.x1 && wy >= r.y0 - 24 && wy < r.y1) return b;
     }
+    for (const m of this.mines) {
+      const r = this.rectOf(m)!;
+      if (wx >= r.x0 && wx < r.x1 && wy >= r.y0 && wy < r.y1) return m;
+    }
+    return null;
+  }
+
+  mineAt(wx: number, wy: number): Mine | null {
     for (const m of this.mines) {
       const r = this.rectOf(m)!;
       if (wx >= r.x0 && wx < r.x1 && wy >= r.y0 && wy < r.y1) return m;
@@ -336,15 +539,14 @@ export class Game {
 
   unitsInRect(x0: number, y0: number, x1: number, y1: number): Unit[] {
     const ax = Math.min(x0, x1), bx = Math.max(x0, x1), ay = Math.min(y0, y1), by = Math.max(y0, y1);
-    return this.units.filter((u) => u.faction === 'player' && !u.dead && u.x >= ax && u.x <= bx && u.y >= ay && u.y <= by);
+    return this.units.filter((u) => u.faction === 'player' && !u.dead && u.x >= ax && u.x <= bx && u.y - u.radius >= ay - 20 && u.y <= by);
   }
 
   nearestEnemy(e: Entity, range: number, unitsOnly = false): Entity | null {
-    const foe: Faction = e.faction === 'player' ? 'enemy' : 'player';
     let best: Entity | null = null, bestD = Infinity;
     const measure = (t: Entity) => (e.type === 'unit' ? this.edgeDist(e, t) : dist(e.x, e.y, t.x, t.y) - e.radius - t.radius);
     for (const u of this.units) {
-      if (u.faction !== foe || u.dead) continue;
+      if (u.dead || !hostile(e.faction, u.faction)) continue;
       if (e.faction === 'player' && !this.isVisible(u.x, u.y)) continue;
       const d = measure(u);
       if (d <= range && d < bestD) {
@@ -352,9 +554,9 @@ export class Game {
         best = u;
       }
     }
-    if (best || unitsOnly) return best;
+    if (best || unitsOnly || e.faction === 'creep') return best;
     for (const b of this.buildings) {
-      if (b.faction !== foe || b.dead) continue;
+      if (b.dead || !hostile(e.faction, b.faction)) continue;
       const d = measure(b);
       if (d <= range && d < bestD) {
         bestD = d;
@@ -428,12 +630,18 @@ export class Game {
 
   cmdMove(units: Unit[], x: number, y: number) {
     this.spreadOrders(units, x, y, (px, py) => ({ kind: 'move', x: px, y: py }));
-    this.effects.push({ kind: 'ping', x, y, t: 0, dur: 0.7, r: 14, color: '#5bd46b' });
+    if (units.some((u) => u.faction === 'player')) {
+      this.effects.push({ kind: 'ping', x, y, t: 0, dur: 0.7, r: 14, color: '#5bd46b' });
+      sound.play('move');
+    }
   }
 
   cmdAttackMove(units: Unit[], x: number, y: number) {
     this.spreadOrders(units, x, y, (px, py) => ({ kind: 'attackmove', x: px, y: py }));
-    if (units.some((u) => u.faction === 'player')) this.effects.push({ kind: 'pingAttack', x, y, t: 0, dur: 0.7, r: 14, color: '#ff6b5b' });
+    if (units.some((u) => u.faction === 'player')) {
+      this.effects.push({ kind: 'pingAttack', x, y, t: 0, dur: 0.7, r: 14, color: '#ff6b5b' });
+      sound.play('move');
+    }
   }
 
   private spreadOrders(units: Unit[], x: number, y: number, make: (px: number, py: number) => Order) {
@@ -465,6 +673,7 @@ export class Game {
       u.order = { kind: 'attack', target, resume: null };
     }
     this.effects.push({ kind: 'pingAttack', x: target.x, y: target.y, t: 0, dur: 0.7, r: target.radius + 6, color: '#ff6b5b' });
+    sound.play('move');
   }
 
   cmdStop(units: Unit[]) {
@@ -477,10 +686,11 @@ export class Game {
   cmdGatherGold(units: Unit[], mine: Mine) {
     for (const u of units) {
       this.resetMotion(u);
-      if (u.def.kind !== 'worker') u.order = { kind: 'move', x: mine.x, y: mine.y };
+      if (u.def.kind !== 'worker') u.order = { kind: 'move', x: mine.x, y: mine.y + mine.radius + 20 };
       else u.order = { kind: 'gather', res: 'gold', mine, tree: null };
     }
     this.effects.push({ kind: 'ping', x: mine.x, y: mine.y, t: 0, dur: 0.7, r: 20, color: '#f5c542' });
+    sound.play('move');
   }
 
   cmdGatherWood(units: Unit[], tree: TilePos) {
@@ -490,6 +700,7 @@ export class Game {
       else u.order = { kind: 'gather', res: 'wood', mine: null, tree };
     }
     this.effects.push({ kind: 'ping', x: tree.tx * TILE + TILE / 2, y: tree.ty * TILE + TILE / 2, t: 0, dur: 0.7, r: 14, color: '#8b5a2b' });
+    sound.play('move');
   }
 
   cmdReturn(units: Unit[]) {
@@ -507,6 +718,7 @@ export class Game {
       if (u.def.kind !== 'worker') u.order = { kind: 'move', x: b.x, y: b.y + b.radius + 20 };
       else u.order = { kind: 'build', building: b };
     }
+    sound.play('move');
   }
 
   cmdBuild(workers: Unit[], defId: string, tx: number, ty: number): boolean {
@@ -514,10 +726,12 @@ export class Game {
     const r = this.res.player;
     if (!this.canPlaceBuilding(defId, tx, ty)) {
       this.msg('Hier kann nicht gebaut werden.');
+      sound.play('error');
       return false;
     }
     if (r.gold < def.gold || r.wood < def.wood) {
       this.msg('Nicht genug Rohstoffe.');
+      sound.play('error');
       return false;
     }
     const ws = workers.filter((u) => u.def.kind === 'worker');
@@ -530,6 +744,7 @@ export class Game {
       w.order = { kind: 'build', building: b };
     }
     this.effects.push({ kind: 'ping', x: b.x, y: b.y, t: 0, dur: 0.7, r: b.radius, color: '#5bd46b' });
+    sound.play('build');
     return true;
   }
 
@@ -540,59 +755,118 @@ export class Game {
     this.killBuilding(b, false);
   }
 
-  cmdTrain(b: Building, defId: string, force = false): boolean {
+  cmdRally(b: Building, x: number, y: number) {
+    b.rally = { x, y };
+    this.effects.push({ kind: 'rally', x, y, t: 0, dur: 0.8, r: 12, color: '#f2d16b' });
+    sound.play('click');
+  }
+
+  canTrain(b: Building, defId: string): { ok: boolean; why?: string; gold: number; wood: number } {
     const def = UNITS[defId];
+    const f = b.faction as Side;
+    let gold = def.gold;
+    if (defId === 'warden') gold = this.heroCost();
+    if (def.requires && !this.hasBuilding(f, def.requires)) return { ok: false, why: `Benötigt ${BUILDINGS[def.requires].name}`, gold, wood: def.wood };
+    if (this.res[f].gold < gold || this.res[f].wood < def.wood) return { ok: false, why: 'Nicht genug Rohstoffe.', gold, wood: def.wood };
+    if (def.supply > 0 && this.supplyUsed(f) + def.supply > this.supplyCap(f)) return { ok: false, why: 'Nicht genug Versorgung. Baue Gehöfte.', gold, wood: def.wood };
+    return { ok: true, gold, wood: def.wood };
+  }
+
+  cmdTrain(b: Building, defId: string, force = false): boolean {
     if (!b.built || b.dead) return false;
     if (b.queue.length >= 5) {
       this.msg('Warteschlange voll.');
       return false;
     }
-    const f = b.faction as 'player' | 'enemy';
-    let gold = def.gold, wood = def.wood;
-    if (defId === 'warden') {
-      if (this.hero('player') || this.heroQueued()) return false;
-      gold = this.heroCost();
-    }
+    const f = b.faction as Side;
+    if (defId === 'warden' && (this.hero('player') || this.heroQueued())) return false;
+    const def = UNITS[defId];
     if (!force) {
-      if (this.res[f].gold < gold || this.res[f].wood < wood) {
-        this.msg('Nicht genug Rohstoffe.');
+      const c = this.canTrain(b, defId);
+      if (!c.ok) {
+        this.msg(c.why ?? 'Nicht möglich.');
+        sound.play('error');
         return false;
       }
-      if (def.supply > 0 && this.supplyUsed(f) + def.supply > this.supplyCap(f)) {
-        this.msg('Nicht genug Versorgung. Baue Gehöfte.');
-        return false;
-      }
-      this.res[f].gold -= gold;
-      this.res[f].wood -= wood;
+      this.res[f].gold -= c.gold;
+      this.res[f].wood -= c.wood;
+      sound.play('click');
     }
     b.queue.push({ id: defId, t: 0, total: def.trainTime });
+    return true;
+  }
+
+  cmdResearch(b: Building, upId: string): boolean {
+    const up = UPGRADES[upId];
+    const f = b.faction as Side;
+    const lvl = this.research[f][upId] ?? 0;
+    if (!b.built || b.dead || lvl >= up.levels.length || this.researchQueued(f, upId)) return false;
+    const cost = up.levels[lvl];
+    if (this.res[f].gold < cost.gold || this.res[f].wood < cost.wood) {
+      this.msg('Nicht genug Rohstoffe.');
+      sound.play('error');
+      return false;
+    }
+    this.res[f].gold -= cost.gold;
+    this.res[f].wood -= cost.wood;
+    b.queue.push({ id: 'up:' + upId, t: 0, total: cost.time });
+    sound.play('click');
     return true;
   }
 
   cmdCancelTrain(b: Building) {
     const q = b.queue.pop();
     if (!q || b.faction !== 'player') return;
+    if (q.id.startsWith('up:')) {
+      const up = UPGRADES[q.id.slice(3)];
+      const cost = up.levels[this.research.player[up.id] ?? 0];
+      this.res.player.gold += cost.gold;
+      this.res.player.wood += cost.wood;
+      return;
+    }
     const def = UNITS[q.id];
     this.res.player.gold += q.id === 'warden' ? this.heroCost() : def.gold;
     this.res.player.wood += def.wood;
   }
 
   cmdShockwave(hero: Unit): boolean {
+    const A = ABILITIES.shockwave;
     if (hero.abilityCd > 0) {
-      this.msg(`Erdstoß bereit in ${Math.ceil(hero.abilityCd)}s`);
+      if (hero.faction === 'player') this.msg(`${A.name} bereit in ${Math.ceil(hero.abilityCd)}s`);
       return false;
     }
-    hero.abilityCd = SHOCKWAVE.cooldown;
-    const dmg = SHOCKWAVE.baseDamage + SHOCKWAVE.perLevel * (hero.level - 1);
-    this.effects.push({ kind: 'boom', x: hero.x, y: hero.y, t: 0, dur: 0.6, r: SHOCKWAVE.radius, color: '#f2d16b' });
-    const foe: Faction = hero.faction === 'player' ? 'enemy' : 'player';
+    hero.abilityCd = A.cooldown;
+    hero.attackAnim = 0.3;
+    const dmg = A.baseDamage + A.perLevel * (hero.level - 1);
+    this.effects.push({ kind: 'boom', x: hero.x, y: hero.y, t: 0, dur: 0.6, r: A.radius, color: '#f2d16b' });
+    sound.play('shock');
     for (const u of [...this.units]) {
-      if (u.faction !== foe || u.dead) continue;
-      if (dist(u.x, u.y, hero.x, hero.y) - u.radius <= SHOCKWAVE.radius) this.applyDamage(u, dmg, hero);
+      if (u.dead || !hostile(hero.faction, u.faction)) continue;
+      if (dist(u.x, u.y, hero.x, hero.y) - u.radius <= A.radius) this.applyDamage(u, dmg, hero, true);
     }
     for (const b of [...this.buildings]) {
-      if (b.faction !== foe || b.dead) continue;
-      if (this.rectDist({ ...hero } as Unit, b.tx * TILE, b.ty * TILE, (b.tx + b.size) * TILE, (b.ty + b.size) * TILE) <= SHOCKWAVE.radius) this.applyDamage(b, dmg * 0.5, hero);
+      if (b.dead || !hostile(hero.faction, b.faction)) continue;
+      if (this.rectDist(hero, b.tx * TILE, b.ty * TILE, (b.tx + b.size) * TILE, (b.ty + b.size) * TILE) <= A.radius) this.applyDamage(b, dmg * 0.5, hero, true);
+    }
+    return true;
+  }
+
+  cmdBlessing(hero: Unit): boolean {
+    const A = ABILITIES.blessing;
+    if (hero.blessCd > 0) {
+      if (hero.faction === 'player') this.msg(`${A.name} bereit in ${Math.ceil(hero.blessCd)}s`);
+      return false;
+    }
+    hero.blessCd = A.cooldown;
+    const heal = A.baseHeal + A.perLevel * (hero.level - 1);
+    this.effects.push({ kind: 'heal', x: hero.x, y: hero.y, t: 0, dur: 0.9, r: A.radius, color: '#9ff0c0' });
+    sound.play('bless');
+    for (const u of this.units) {
+      if (u.dead || u.faction !== hero.faction) continue;
+      if (dist(u.x, u.y, hero.x, hero.y) <= A.radius && u.hp < u.maxHp) {
+        u.hp = Math.min(u.maxHp, u.hp + heal);
+        this.effects.push({ kind: 'text', x: u.x, y: u.y - u.radius, t: 0, dur: 0.9, r: 0, color: '#9ff0c0', text: `+${heal}` });
+      }
     }
     return true;
   }
@@ -611,6 +885,8 @@ export class Game {
     this.effects = this.effects.filter((e) => e.t < e.dur);
     for (const m of this.messages) m.t += dt;
     this.messages = this.messages.filter((m) => m.t < 3.5);
+    this.alertTimer -= dt;
+    if (this.alert && this.time - this.alert.t > 20) this.alert = null;
     this.ai.update(this, dt);
     this.fogTimer -= dt;
     if (this.fogTimer <= 0) {
@@ -619,6 +895,11 @@ export class Game {
     }
     this.cleanup();
     this.checkResult();
+    this.autosave -= dt;
+    if (this.autosave <= 0) {
+      this.autosave = 30;
+      this.save();
+    }
   }
 
   private buildGrid() {
@@ -637,7 +918,6 @@ export class Game {
       const cx = k % 4096, cy = Math.floor(k / 4096);
       for (let oy = 0; oy <= 1; oy++)
         for (let ox = oy === 0 ? 0 : -1; ox <= 1; ox++) {
-          if (oy === 0 && ox < 0) continue;
           const other = ox === 0 && oy === 0 ? cell : this.grid.get(cx + ox + (cy + oy) * 4096);
           if (!other) continue;
           for (let i = 0; i < cell.length; i++) {
@@ -690,13 +970,16 @@ export class Game {
   private updateUnit(u: Unit, dt: number) {
     u.cooldown -= dt;
     u.abilityCd -= dt;
+    u.blessCd -= dt;
     u.acquireTimer -= dt;
     u.repathTimer -= dt;
     u.attackAnim -= dt;
+    const px = u.x, py = u.y;
     const o = u.order;
     switch (o.kind) {
       case 'idle':
-        if (u.def.kind !== 'worker') this.tryAcquire(u, null);
+        if (u.faction === 'creep') this.creepIdle(u, dt);
+        else if (u.def.kind !== 'worker') this.tryAcquire(u, null);
         break;
       case 'move':
         if (this.moveTo(u, o.x, o.y, dt)) u.order = IDLE;
@@ -718,13 +1001,25 @@ export class Game {
         this.doBuild(u, o, dt);
         break;
     }
+    const moved = Math.hypot(u.x - px, u.y - py);
+    u.moving = moved > 0.2;
+    if (u.moving) u.walkPhase += dt * 9;
+  }
+
+  private creepIdle(u: Unit, dt: number) {
+    if (u.home && dist(u.x, u.y, u.home.x, u.home.y) > 40) {
+      if (this.moveTo(u, u.home.x, u.home.y, dt)) u.order = IDLE;
+      return;
+    }
+    if (u.hp < u.maxHp) u.hp = Math.min(u.maxHp, u.hp + u.maxHp * 0.03 * dt);
+    if (this.tryAcquire(u, null)) return;
   }
 
   private tryAcquire(u: Unit, resume: Order | null): boolean {
     if (u.acquireTimer > 0) return false;
     u.acquireTimer = 0.25;
-    const aggro = Math.max(u.sight * 0.75, u.def.range + 60);
-    const t = this.nearestEnemy(u, aggro);
+    const aggro = u.faction === 'creep' ? 170 : Math.max(this.unitSight(u) * 0.75, u.def.range + 60);
+    const t = this.nearestEnemy(u, aggro, u.def.kind === 'siege' ? false : false);
     if (!t) return false;
     this.resetMotion(u);
     u.order = { kind: 'attack', target: t, resume };
@@ -880,9 +1175,10 @@ export class Game {
       this.resetMotion(u);
       return;
     }
-    // Bei automatisch aufgenommenen Zielen: nicht endlos verfolgen
-    if (o.resume && dist(u.x, u.y, t.x, t.y) > u.sight * 1.6) {
-      u.order = o.resume;
+    // Bei automatisch aufgenommenen Zielen: nicht endlos verfolgen; Kreaturen bleiben nahe ihrem Lager
+    const leash = u.faction === 'creep' && u.home ? dist(u.x, u.y, u.home.x, u.home.y) > 300 : o.resume !== null && dist(u.x, u.y, t.x, t.y) > u.sight * 1.6;
+    if (leash) {
+      u.order = o.resume ?? IDLE;
       this.resetMotion(u);
       return;
     }
@@ -898,21 +1194,36 @@ export class Game {
 
   private fire(u: Unit, t: Entity) {
     u.cooldown = u.def.cooldown;
-    u.attackAnim = 0.2;
+    u.attackAnim = 0.25;
     const dmg = this.unitDamage(u);
-    if (u.def.kind === 'ranged') {
-      this.projectiles.push({ x: u.x, y: u.y, target: t, tx: t.x, ty: t.y, speed: 430, damage: dmg, attacker: u, color: u.faction === 'player' ? '#e8e2c0' : '#b06fd0' });
+    if (u.def.kind === 'ranged' || u.def.kind === 'siege') {
+      const siege = u.def.kind === 'siege';
+      const kind = siege ? 'rock' : u.def.look.weapon === 'spit' ? 'spit' : 'arrow';
+      const total = dist(u.x, u.y, t.x, t.y);
+      this.projectiles.push({ x: u.x, y: u.y - 14, target: t, tx: t.x, ty: t.y, speed: siege ? 260 : 430, damage: dmg, attacker: u, kind, arc: siege ? 70 : 18, total, travelled: 0 });
+      if (u.faction === 'player' && this.isVisible(u.x, u.y)) sound.play('arrow');
     } else {
       this.applyDamage(t, dmg, u);
-      this.effects.push({ kind: 'hit', x: t.x + (Math.random() - 0.5) * 10, y: t.y + (Math.random() - 0.5) * 10, t: 0, dur: 0.2, r: 6, color: '#fff' });
+      this.effects.push({ kind: 'hit', x: t.x + (Math.random() - 0.5) * 10, y: t.y - 10 + (Math.random() - 0.5) * 10, t: 0, dur: 0.2, r: 6, color: '#fff' });
+      if (this.isVisible(t.x, t.y)) sound.play('attack');
     }
   }
 
-  applyDamage(t: Entity, dmg: number, attacker: Entity | null) {
+  applyDamage(t: Entity, raw: number, attacker: Entity | null, isAbility = false) {
     if (t.dead || t.type === 'mine') return;
+    let dmg = raw;
+    if (attacker && attacker.type === 'unit' && attacker.def.kind === 'siege' && !isAbility) dmg *= t.type === 'building' ? SIEGE_BUILDING_MULT : SIEGE_UNIT_MULT;
+    const armor = t.type === 'unit' ? this.unitArmor(t) : t.def.armor;
+    dmg *= Math.max(0.35, 1 - armor * 0.06);
     t.hp -= dmg;
     if (t.type === 'unit' && attacker && attacker.type === 'unit' && t.order.kind === 'idle' && t.def.kind !== 'worker') {
       t.order = { kind: 'attack', target: attacker, resume: null };
+    }
+    if (t.faction === 'player' && this.alertTimer <= 0) {
+      this.alertTimer = 12;
+      this.alert = { x: t.x, y: t.y, t: this.time };
+      this.msg(t.type === 'building' ? 'Unsere Basis wird angegriffen!' : 'Unsere Einheiten werden angegriffen!');
+      sound.play('alert');
     }
     if (t.hp <= 0) {
       if (t.type === 'unit') this.killUnit(t, attacker);
@@ -923,9 +1234,11 @@ export class Game {
   private killUnit(u: Unit, killer: Entity | null) {
     u.dead = true;
     u.hp = 0;
-    this.effects.push({ kind: 'death', x: u.x, y: u.y, t: 0, dur: 0.8, r: u.radius, color: u.def.color });
+    this.effects.push({ kind: 'death', x: u.x, y: u.y, t: 0, dur: 0.8, r: u.radius, color: u.def.look.body });
+    this.effects.push({ kind: 'blood', x: u.x, y: u.y, t: 0, dur: 6, r: u.radius, color: u.faction === 'enemy' ? '#4a6a3a' : '#7a1f1f' });
+    if (this.isVisible(u.x, u.y)) sound.play('death');
     if (u.faction === 'enemy') this.stats.killed++;
-    else this.stats.lost++;
+    else if (u.faction === 'player') this.stats.lost++;
     if (u.def.kind === 'hero' && u.faction === 'player') {
       this.heroLevel = u.level;
       this.heroXp = u.xp;
@@ -934,6 +1247,13 @@ export class Game {
     if (killer) {
       const hero = this.hero(killer.faction);
       if (hero && dist(hero.x, hero.y, u.x, u.y) < 380) this.gainXp(hero, u.def.xpValue);
+      if (u.def.bounty && (killer.faction === 'player' || killer.faction === 'enemy')) {
+        this.res[killer.faction].gold += u.def.bounty;
+        if (killer.faction === 'player') {
+          this.effects.push({ kind: 'text', x: u.x, y: u.y - 16, t: 0, dur: 1.2, r: 0, color: '#f5c542', text: `+${u.def.bounty} Gold` });
+          sound.play('gold');
+        }
+      }
     }
   }
 
@@ -949,6 +1269,7 @@ export class Game {
       if (hero.faction === 'player') {
         this.msg(`Wächterin erreicht Stufe ${hero.level}!`);
         this.heroLevel = hero.level;
+        sound.play('levelup');
       }
     }
     if (hero.faction === 'player') this.heroXp = hero.xp;
@@ -960,11 +1281,13 @@ export class Game {
     this.map.setBuildingBlock(b.tx, b.ty, b.size, false);
     if (explode) {
       this.effects.push({ kind: 'death', x: b.x, y: b.y, t: 0, dur: 1.2, r: b.radius, color: '#777' });
+      for (let i = 0; i < 6; i++) this.effects.push({ kind: 'smoke', x: b.x + (Math.random() - 0.5) * b.radius * 1.5, y: b.y + (Math.random() - 0.5) * b.radius, t: -i * 0.15, dur: 2.5, r: 10 + Math.random() * 10, color: '#555' });
       if (killer) {
         const hero = this.hero(killer.faction);
         if (hero && dist(hero.x, hero.y, b.x, b.y) < 420) this.gainXp(hero, 60);
       }
       if (b.faction === 'player') this.msg(`${b.def.name} wurde zerstört!`);
+      if (this.isVisible(b.x, b.y)) sound.play('shock');
     }
   }
 
@@ -987,6 +1310,7 @@ export class Game {
       }
       const r = this.moveToEntity(u, o.mine, INTERACT_RANGE, dt);
       if (r === 'inrange') {
+        u.facing = Math.atan2(o.mine.y - u.y, o.mine.x - u.x);
         u.gatherTimer += dt;
         if (u.gatherTimer >= GOLD_MINE_TIME) {
           u.gatherTimer = 0;
@@ -1011,6 +1335,7 @@ export class Game {
       if (r === 'inrange') {
         u.facing = Math.atan2(o.tree.ty * TILE + 16 - u.y, o.tree.tx * TILE + 16 - u.x);
         u.gatherTimer += dt;
+        if (u.attackAnim <= -0.6) u.attackAnim = 0.25;
         if (u.gatherTimer >= WOOD_CHOP_TIME) {
           u.gatherTimer = 0;
           const j = this.map.idx(o.tree.tx, o.tree.ty);
@@ -1035,7 +1360,7 @@ export class Game {
     }
     const r = this.moveToEntity(u, hall, INTERACT_RANGE, dt);
     if (r === 'inrange') {
-      if (u.faction !== 'neutral') this.res[u.faction][u.carry.res] += u.carry.amount;
+      if (u.faction === 'player' || u.faction === 'enemy') this.res[u.faction][u.carry.res] += u.carry.amount;
       u.carry = null;
       u.order = o.then;
       this.resetMotion(u);
@@ -1051,7 +1376,7 @@ export class Game {
     const r = this.moveToEntity(u, b, INTERACT_RANGE, dt);
     if (r === 'inrange') {
       u.facing = Math.atan2(b.y - u.y, b.x - u.x);
-      u.attackAnim = 0.1;
+      if (u.attackAnim <= -0.5) u.attackAnim = 0.2;
       b.progress += dt / b.def.buildTime;
       b.hp = Math.max(b.hp, Math.min(b.maxHp, b.progress * b.maxHp));
       if (b.progress >= 1) {
@@ -1060,6 +1385,7 @@ export class Game {
         b.hp = b.maxHp;
         this.effects.push({ kind: 'ring', x: b.x, y: b.y, t: 0, dur: 0.6, r: b.radius + 10, color: '#5bd46b' });
         this.msg(`${b.def.name} fertiggestellt.`);
+        sound.play('done');
         u.order = IDLE;
       }
     } else if (r === 'fail') u.order = IDLE;
@@ -1068,13 +1394,28 @@ export class Game {
   private updateBuilding(b: Building, dt: number) {
     b.cooldown -= dt;
     b.supplyWarn -= dt;
+    b.smoke -= dt;
     if (!b.built) return;
+    if (b.def.style === 'forge' && b.smoke <= 0) {
+      b.smoke = 0.5;
+      this.effects.push({ kind: 'smoke', x: b.x + 28, y: b.y - 50, t: 0, dur: 2, r: 5, color: '#777' });
+    }
     if (b.queue.length) {
       const q = b.queue[0];
-      const def = UNITS[q.id];
-      const f = b.faction as 'player' | 'enemy';
+      const f = b.faction as Side;
       q.t += dt;
-      if (q.t >= q.total) {
+      if (q.id.startsWith('up:')) {
+        if (q.t >= q.total) {
+          b.queue.shift();
+          const id = q.id.slice(3);
+          this.research[f][id] = (this.research[f][id] ?? 0) + 1;
+          if (f === 'player') {
+            this.msg(`${UPGRADES[id].name} Stufe ${this.research[f][id]} erforscht.`);
+            sound.play('done');
+          }
+        }
+      } else if (q.t >= q.total) {
+        const def = UNITS[q.id];
         const used = this.supplyUsed(f) - def.supply; // eigenes Reservat abziehen
         if (f === 'player' && def.supply > 0 && used + def.supply > this.supplyCap(f)) {
           q.t = q.total;
@@ -1092,10 +1433,8 @@ export class Game {
             this.heroSummoned = true;
             this.msg('Die Wächterin ist zurück.');
           }
-          if (u && u.def.kind === 'worker') {
-            const mine = this.nearestMine(u.x, u.y);
-            if (mine && dist(mine.x, mine.y, u.x, u.y) < 400) u.order = { kind: 'gather', res: 'gold', mine, tree: null };
-          }
+          if (u && f === 'player') sound.play('done');
+          if (u) this.applyRally(u, b);
         }
       }
     }
@@ -1104,25 +1443,61 @@ export class Game {
       const t = this.nearestEnemy(b, a.range);
       if (t) {
         b.cooldown = a.cooldown;
-        this.projectiles.push({ x: b.x, y: b.y - b.radius * 0.6, target: t, tx: t.x, ty: t.y, speed: 460, damage: a.damage, attacker: b, color: b.faction === 'player' ? '#ffe28a' : '#c05fe0' });
+        const total = dist(b.x, b.y, t.x, t.y);
+        this.projectiles.push({ x: b.x, y: b.y - b.radius * 1.2, target: t, tx: t.x, ty: t.y, speed: 460, damage: a.damage, attacker: b, kind: 'bolt', arc: 10, total, travelled: 0 });
       }
     }
+  }
+
+  private applyRally(u: Unit, b: Building) {
+    if (u.def.kind === 'worker') {
+      const r = b.rally;
+      const mine = r ? this.mineAt(r.x, r.y) : this.nearestMine(u.x, u.y);
+      if (r) {
+        const tx = Math.floor(r.x / TILE), ty = Math.floor(r.y / TILE);
+        if (mine) {
+          u.order = { kind: 'gather', res: 'gold', mine, tree: null };
+          return;
+        }
+        if (this.map.tileAt(tx, ty) === T_TREE) {
+          u.order = { kind: 'gather', res: 'wood', mine: null, tree: { tx, ty } };
+          return;
+        }
+        u.order = { kind: 'move', x: r.x, y: r.y };
+        return;
+      }
+      if (mine && dist(mine.x, mine.y, u.x, u.y) < 400) u.order = { kind: 'gather', res: 'gold', mine, tree: null };
+      return;
+    }
+    if (b.rally) u.order = { kind: 'attackmove', x: b.rally.x, y: b.rally.y };
   }
 
   private updateProjectiles(dt: number) {
     for (const p of this.projectiles) {
       if (!p.target.dead) {
         p.tx = p.target.x;
-        p.ty = p.target.y;
+        p.ty = p.target.y - (p.target.type === 'unit' ? 10 : 20);
       }
       const d = dist(p.x, p.y, p.tx, p.ty);
       const step = p.speed * dt;
+      p.travelled += step;
       if (d <= step + 3) {
         p.x = p.tx;
         p.y = p.ty;
         p.speed = 0;
         if (!p.target.dead) this.applyDamage(p.target, p.damage, p.attacker);
-        this.effects.push({ kind: 'hit', x: p.tx, y: p.ty, t: 0, dur: 0.18, r: 5, color: p.color });
+        if (p.kind === 'rock') {
+          this.effects.push({ kind: 'boom', x: p.tx, y: p.ty + 10, t: 0, dur: 0.4, r: 28, color: '#c9b08a' });
+          // Flächenschaden um den Einschlag
+          for (const u of [...this.units]) {
+            if (u.dead || u === p.target || !hostile(p.attacker.faction, u.faction)) continue;
+            if (dist(u.x, u.y, p.tx, p.ty) < 40) this.applyDamage(u, p.damage * 0.5, p.attacker);
+          }
+          if (this.isVisible(p.tx, p.ty)) sound.play('hit');
+        } else {
+          this.effects.push({ kind: 'hit', x: p.tx, y: p.ty, t: 0, dur: 0.18, r: 5, color: p.kind === 'spit' ? '#b06fd0' : '#fff' });
+          if (this.isVisible(p.tx, p.ty)) sound.play('hit');
+        }
       } else {
         p.x += ((p.tx - p.x) / d) * step;
         p.y += ((p.ty - p.y) / d) * step;
@@ -1146,7 +1521,7 @@ export class Game {
           if (dx * dx + dy * dy <= r2) v[ty * MAP_W + tx] = 2;
         }
     };
-    for (const u of this.units) if (u.faction === 'player' && !u.dead) reveal(u.x, u.y, u.sight);
+    for (const u of this.units) if (u.faction === 'player' && !u.dead) reveal(u.x, u.y, this.unitSight(u));
     for (const b of this.buildings) if (b.faction === 'player' && !b.dead) reveal(b.x, b.y, b.built ? b.sight : b.sight * 0.6);
     this.fogVersion++;
   }
@@ -1165,14 +1540,19 @@ export class Game {
   }
 
   private checkResult() {
-    if (!this.spawnedHallTick) return;
     const enemyHall = this.buildings.some((b) => b.faction === 'enemy' && b.def.isHall && !b.dead);
     if (!enemyHall) {
       this.result = 'victory';
+      Game.clearSave();
+      sound.play('victory');
       return;
     }
     const playerBuildings = this.buildings.some((b) => b.faction === 'player' && !b.dead);
     const playerWorkers = this.units.some((u) => u.faction === 'player' && u.def.kind === 'worker' && !u.dead);
-    if (!playerBuildings && !playerWorkers) this.result = 'defeat';
+    if (!playerBuildings && !playerWorkers) {
+      this.result = 'defeat';
+      Game.clearSave();
+      sound.play('defeat');
+    }
   }
 }

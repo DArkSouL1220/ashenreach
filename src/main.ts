@@ -7,11 +7,13 @@ import { Renderer } from './render';
 
 document.getElementById('boot')?.remove();
 const canvas = document.getElementById('game') as HTMLCanvasElement;
-const app = { game: new Game((Date.now() % 100000) + 1) };
+const newSeed = () => (Date.now() % 100000) + 1;
+const app = { game: new Game(newSeed()) };
 const cam = new Camera();
 const renderer = new Renderer(canvas, app.game, cam);
-const hud = new Hud(app, cam, renderer, () => {
-  app.game = new Game((Date.now() % 100000) + 1);
+const hud = new Hud(app, cam, renderer, (load) => {
+  const loaded = load ? Game.load() : null;
+  app.game = loaded ?? new Game(newSeed());
   renderer.setGame(app.game);
 });
 const input = new Input(canvas, app, cam, hud);
@@ -66,14 +68,22 @@ try {
   const sel = params.get('sel');
   if (sel) {
     const g = app.game;
-    const e = sel === 'hero' ? g.hero('player') : sel === 'keep' ? g.buildings.find((b) => b.def.id === 'keep') : g.units.find((u) => u.faction === 'player' && u.def.id === sel);
+    const e = sel === 'hero' ? g.hero('player') : (g.buildings.find((b) => b.def.id === sel) ?? g.units.find((u) => u.def.id === sel && (u.faction === 'player' || params.has('reveal'))));
     if (e) {
       g.select([e]);
       hud.onSelectionChanged();
       cam.centerOn(e.x, e.y);
     }
   }
+  const t = params.get('time');
+  if (t) app.game.time = Number(t);
   tick(1 / 30);
+  if (params.has('reveal')) {
+    app.game.vis.fill(2);
+    app.game.fogVersion++;
+    app.game.fogTimer = 999;
+    renderer.draw(input.overlay);
+  }
 } catch (err) {
   showError(String(err instanceof Error ? err.stack ?? err.message : err));
 }
@@ -87,8 +97,17 @@ if (params.has('debug')) {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && hud.running) {
-    hud.paused = true;
-    const btn = document.getElementById('btnPause');
-    if (btn) btn.textContent = '▶️';
+    app.game.save();
+    hud.setPaused(true);
   }
 });
+window.addEventListener('pagehide', () => {
+  if (hud.running) app.game.save();
+});
+
+// Offline-Betrieb (nur über http/https, nicht bei file:// und nicht im Artifact-Rahmen)
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost') && !params.has('nosw')) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}

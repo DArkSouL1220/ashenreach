@@ -4,6 +4,7 @@ import { Entity, Game, Unit } from './game';
 import { Hud, Targeting } from './hud';
 import { T_TREE, TILE } from './map';
 import { Overlay } from './render';
+import { sound } from './sound';
 
 export interface App {
   game: Game;
@@ -42,7 +43,12 @@ export class Input {
       if (e.key === 'Escape') {
         this.hud.clearTargeting();
         this.hud.setBuildMenu(false);
-      } else this.hud.hotkey(e.key.toLowerCase());
+      } else if (e.key === ' ') {
+        e.preventDefault();
+        const h = this.app.game.hero('player');
+        if (h) this.cam.centerOn(h.x, h.y);
+      } else if (e.key === 'p') this.hud.setPaused(!this.hud.paused);
+      else this.hud.hotkey(e.key.toLowerCase());
     });
     window.addEventListener('keyup', (e) => this.keys.delete(e.key.toLowerCase()));
     window.addEventListener('blur', () => this.keys.clear());
@@ -51,10 +57,10 @@ export class Input {
   update(dt: number) {
     const v = 600 * dt;
     let dx = 0, dy = 0;
-    if (this.keys.has('arrowleft') || this.keys.has('a')) dx -= v;
-    if (this.keys.has('arrowright') || this.keys.has('d')) dx += v;
-    if (this.keys.has('arrowup') || this.keys.has('w')) dy -= v;
-    if (this.keys.has('arrowdown') || this.keys.has('s')) dy += v;
+    if (this.keys.has('arrowleft')) dx -= v;
+    if (this.keys.has('arrowright')) dx += v;
+    if (this.keys.has('arrowup')) dy -= v;
+    if (this.keys.has('arrowdown')) dy += v;
     if (dx || dy) this.cam.pan(dx, dy);
     this.updateGhost();
   }
@@ -189,8 +195,10 @@ export class Input {
     let units = g.unitsInRect(a.x, a.y, b.x, b.y);
     const combat = units.filter((u) => u.def.kind !== 'worker');
     if (combat.length) units = combat;
-    if (units.length) g.select(units);
-    else if (!touch) g.select([]);
+    if (units.length) {
+      g.select(units);
+      sound.play('select');
+    } else if (!touch) g.select([]);
     this.hud.onSelectionChanged();
   }
 
@@ -226,8 +234,24 @@ export class Input {
       this.contextCommand(ent, w.x, w.y);
       return;
     }
+    const blds = g.selectedPlayerBuildings();
+    if (blds.length === 1 && !ent) {
+      this.rallyOrDeselect(blds[0], w.x, w.y);
+      return;
+    }
     if (ent) this.selectEntity(ent);
     else {
+      g.select([]);
+      this.hud.onSelectionChanged();
+    }
+  }
+
+  private rallyOrDeselect(b: import('./game').Building, wx: number, wy: number) {
+    const g = this.app.game;
+    if (b.built && b.def.trains.length) {
+      g.cmdRally(b, wx, wy);
+      this.hud.onSelectionChanged();
+    } else {
       g.select([]);
       this.hud.onSelectionChanged();
     }
@@ -243,6 +267,7 @@ export class Input {
       const same = g.units.filter((u) => u.faction === 'player' && !u.dead && u.def === ent.def && u.x >= x0 && u.x <= x1 && u.y >= y0 && u.y <= y1);
       g.select(same);
     } else g.select([ent]);
+    if (ent.faction === 'player') sound.play('select');
     this.hud.setBuildMenu(false);
     this.hud.onSelectionChanged();
   }
@@ -251,7 +276,9 @@ export class Input {
     const g = this.app.game;
     const units = g.selectedPlayerUnits();
     if (!units.length) {
-      if (!ent) {
+      const blds = g.selectedPlayerBuildings();
+      if (!ent && blds.length === 1) this.rallyOrDeselect(blds[0], wx, wy);
+      else if (!ent) {
         g.select([]);
         this.hud.onSelectionChanged();
       }
@@ -259,7 +286,7 @@ export class Input {
     }
     const workers = units.filter((u) => u.def.kind === 'worker');
     if (ent) {
-      if (ent.faction === 'enemy') {
+      if (ent.faction === 'enemy' || ent.faction === 'creep') {
         g.cmdAttack(units, ent);
         return;
       }
